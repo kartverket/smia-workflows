@@ -1,0 +1,115 @@
+name: Release app 
+
+on:
+  workflow_call:
+    inputs:
+      application:
+        description: "The name of the application"
+        required: true
+        type: string
+      version:
+        description: "The version of the app"
+        required: true
+        type: string
+      digest:
+        description: "The digest of the docker image to deploy"
+        required: false
+        type: string
+        default: ""
+      deploy_dev:
+        description: "Deploy to dev?"
+        default: false
+        type: boolean
+      deploy_prod:
+        description: "Deploy to prod?"
+        default: false
+        type: boolean
+      namespace:
+        description: "Kubernetes namespace to deploy to"
+        default: "nibas-main"
+        type: string
+      extra_namespace:
+        description: "If you need to release the app into an extra dev-namespace add it here"
+        required: false
+        type: string
+        default: ""
+      identity:
+        description: "The identity to use for Octo STS"
+        required: true
+        type: string
+      cluster:
+        type: string
+        default: "atkv3"
+        description: "Which cluster to deploy to (atkv3 or atgcp1)"
+        required: false
+        
+
+jobs:
+  release-app:
+    concurrency: smia-deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Octo STS
+        uses: octo-sts/action@v1.1.1
+        id: octo-sts
+        with:
+          scope: kartverket/smia-apps
+          identity: ${{ inputs.identity }}
+      - name: Checkout the repository
+        uses: actions/checkout@v6
+        with:
+          repository: kartverket/smia-apps
+          ref: main
+          token: ${{ steps.octo-sts.outputs.token }}
+
+      - name: Update smia-apps
+        run: |
+          git config --global user.email "smia@kartverket.no"
+          git config --global user.name "SMIA CI"
+          git pull
+
+          IMAGEURL="ghcr.io/kartverket/${{ inputs.application }}:${{ inputs.version }}";
+          if [ "${{ inputs.digest }}" != "" ]; then IMAGEURL=$IMAGEURL@${{ inputs.digest }}; fi
+
+          echo "### Deploying \"$IMAGEURL\" 🚀" >> $GITHUB_STEP_SUMMARY;
+          echo 'Deploy to dev? ${{inputs.deploy_dev}}' >> $GITHUB_STEP_SUMMARY;
+          echo 'Deploy to prod? ${{inputs.deploy_prod}}' >> $GITHUB_STEP_SUMMARY;
+          echo 'Extra dev-namespace? ${{ inputs.extra_namespace }}' >> $GITHUB_STEP_SUMMARY;
+
+          if ${{ inputs.deploy_dev }}; then
+            echo "\"$IMAGEURL\"" > env/${{inputs.cluster}}-dev/${{ inputs.namespace }}/${{ inputs.application }}-version;
+            if [ "${{ inputs.extra_namespace }}" != "" ]; then
+              echo "\"$IMAGEURL\"" > env/${{inputs.cluster}}-dev/${{ inputs.extra_namespace }}/${{ inputs.application }}-version;
+            fi
+          fi
+
+          if ${{ inputs.deploy_prod }}; then
+            echo "\"$IMAGEURL\"" > env/${{inputs.cluster}}-prod/${{ inputs.namespace }}/${{ inputs.application }}-version;
+          fi
+
+          git add .
+          git commit -m "Releaser ${{ inputs.application }}:${{ inputs.version }}"
+          git push
+
+  deploy-dev:
+    runs-on: ubuntu-latest
+    if: inputs.deploy_dev == true
+    environment: dev
+    needs: release-app
+    steps:
+      - name: "Deployed to DEV"
+        run: |
+          echo "Deploy DEV ok"
+          if [ "${{ inputs.extra_namespace }}" != "" ]; then
+            echo "Also deployed to extra namespace: ${{ inputs.extra_namespace }}"
+          fi
+
+  deploy-prod:
+    runs-on: ubuntu-latest
+    if: inputs.deploy_prod == true
+    environment: prod
+    needs: release-app
+    steps:
+      - name: "Deployed to PROD"
+        run: |
+          echo "Deploy PROD ok"
