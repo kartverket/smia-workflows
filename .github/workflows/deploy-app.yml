@@ -1,4 +1,4 @@
-name: Release app 
+name: Release app
 
 on:
   workflow_call:
@@ -26,7 +26,8 @@ on:
         type: boolean
       namespace:
         description: "Kubernetes namespace to deploy to"
-        default: "nibas-main"
+        required: true
+        default: false
         type: string
       extra_namespace:
         description: "If you need to release the app into an extra dev-namespace add it here"
@@ -42,7 +43,7 @@ on:
         default: "atkv3"
         description: "Which cluster to deploy to (atkv3 or atgcp1)"
         required: false
-        
+
 
 jobs:
   release-app:
