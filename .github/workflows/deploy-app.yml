@@ -1,4 +1,4 @@
-name: Release app
+name: Deploy app
 
 on:
   workflow_call:
@@ -13,27 +13,16 @@ on:
         type: string
       digest:
         description: "The digest of the docker image to deploy"
-        required: false
+        required: true
         type: string
-        default: ""
-      deploy_dev:
-        description: "Deploy to dev?"
-        default: false
-        type: boolean
-      deploy_prod:
-        description: "Deploy to prod?"
-        default: false
-        type: boolean
+      environment:
+        description: "The environment to deploy to"
+        required: true
+        type: string
       namespace:
         description: "Kubernetes namespace to deploy to"
         required: true
-        default: false
         type: string
-      extra_namespace:
-        description: "If you need to release the app into an extra dev-namespace add it here"
-        required: false
-        type: string
-        default: ""
       identity:
         description: "The identity to use for Octo STS"
         required: true
@@ -44,11 +33,13 @@ on:
         description: "Which cluster to deploy to (atkv3 or atgcp1)"
         required: false
 
-
 jobs:
-  release-app:
-    concurrency: smia-deploy
+  deploy:
     runs-on: ubuntu-latest
+    concurrency: smia-deploy-${{ inputs.application }}-${{ inputs.environment }}-${{ inputs.namespace }}
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Octo STS
         uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05 #v1.1.1
@@ -56,61 +47,101 @@ jobs:
         with:
           scope: kartverket/smia-apps
           identity: ${{ inputs.identity }}
-      - name: Checkout the repository
-        uses: actions/checkout@v7
+
+      - name: Checkout smia-apps
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: kartverket/smia-apps
           ref: main
           token: ${{ steps.octo-sts.outputs.token }}
 
       - name: Update smia-apps
+        env:
+          APP: ${{ inputs.application }}
+          VERSION: ${{ inputs.version }}
+          DIGEST: ${{ inputs.digest }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          NAMESPACE: ${{ inputs.namespace }}
+          CLUSTER: ${{ inputs.cluster }}
         run: |
-          git config --global user.email "smia@kartverket.no"
-          git config --global user.name "SMIA CI"
-          git pull
+          set -euo pipefail
 
-          IMAGEURL="ghcr.io/kartverket/${{ inputs.application }}:${{ inputs.version }}";
-          if [ "${{ inputs.digest }}" != "" ]; then IMAGEURL=$IMAGEURL@${{ inputs.digest }}; fi
+          case "$ENVIRONMENT" in
+            dev|prod) ;;
+            *) echo "::error::environment must be dev or prod (got \"$ENVIRONMENT\")"; exit 1 ;;
+          esac
 
-          echo "### Deploying \"$IMAGEURL\" 🚀" >> $GITHUB_STEP_SUMMARY;
-          echo 'Deploy to dev? ${{inputs.deploy_dev}}' >> $GITHUB_STEP_SUMMARY;
-          echo 'Deploy to prod? ${{inputs.deploy_prod}}' >> $GITHUB_STEP_SUMMARY;
-          echo 'Extra dev-namespace? ${{ inputs.extra_namespace }}' >> $GITHUB_STEP_SUMMARY;
-
-          if ${{ inputs.deploy_dev }}; then
-            echo "\"$IMAGEURL\"" > env/${{inputs.cluster}}-dev/${{ inputs.namespace }}/${{ inputs.application }}-version;
-            if [ "${{ inputs.extra_namespace }}" != "" ]; then
-              echo "\"$IMAGEURL\"" > env/${{inputs.cluster}}-dev/${{ inputs.extra_namespace }}/${{ inputs.application }}-version;
-            fi
+          if [ -z "${APP:-}" ]; then
+            echo "::error::application is required"
+            exit 1
           fi
 
-          if ${{ inputs.deploy_prod }}; then
-            echo "\"$IMAGEURL\"" > env/${{inputs.cluster}}-prod/${{ inputs.namespace }}/${{ inputs.application }}-version;
+          if [ -z "${VERSION:-}" ]; then
+            echo "::error::version is required"
+            exit 1
           fi
 
-          git add .
-          git commit -m "Releaser ${{ inputs.application }}:${{ inputs.version }}"
-          git push
-
-  deploy-dev:
-    runs-on: ubuntu-latest
-    if: inputs.deploy_dev == true
-    environment: dev
-    needs: release-app
-    steps:
-      - name: "Deployed to DEV"
-        run: |
-          echo "Deploy DEV ok"
-          if [ "${{ inputs.extra_namespace }}" != "" ]; then
-            echo "Also deployed to extra namespace: ${{ inputs.extra_namespace }}"
+          if [ -z "${DIGEST:-}" ]; then
+            echo "::error::digest is required"
+            exit 1
           fi
 
-  deploy-prod:
-    runs-on: ubuntu-latest
-    if: inputs.deploy_prod == true
-    environment: prod
-    needs: release-app
-    steps:
-      - name: "Deployed to PROD"
-        run: |
-          echo "Deploy PROD ok"
+          if ! [[ "$DIGEST" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+            echo "::error::digest must match sha256:<64 hex chars> (got \"$DIGEST\")"
+            exit 1
+          fi
+
+          case "$CLUSTER" in
+            atkv3|atgcp1) ;;
+            *) echo "::error::cluster must be atkv3 or atgcp1 (got \"$CLUSTER\")"; exit 1 ;;
+          esac
+
+          case "$APP" in
+            *[!a-z0-9-]*|"")
+              echo "::error::application must match [a-z0-9-]+ (got \"$APP\")"
+              exit 1
+              ;;
+          esac
+
+          case "$NAMESPACE" in
+            *[!a-z0-9-]*|"")
+              echo "::error::namespace must match [a-z0-9-]+ (got \"$NAMESPACE\")"
+              exit 1
+              ;;
+          esac
+
+          git config user.email "smia@kartverket.no"
+          git config user.name "SMIA CI"
+
+          IMAGEURL="ghcr.io/kartverket/$APP:$VERSION@$DIGEST"
+
+          {
+            echo "### Deploying \"$IMAGEURL\""
+            echo "Environment: $ENVIRONMENT"
+            echo "Namespace: $NAMESPACE"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          FILE="env/$CLUSTER-$ENVIRONMENT/$NAMESPACE/$APP-version"
+
+          if [ ! -f "$FILE" ]; then
+            echo "::error::$FILE does not exist in smia-apps"
+            exit 1
+          fi
+
+          echo "\"$IMAGEURL\"" > "$FILE"
+          git add "$FILE"
+
+          if git diff --cached --quiet; then
+            echo "No changes in the version file. Nothing to commit"
+            exit 0
+          fi
+
+          git commit -m "Releaser $APP:$VERSION to $ENVIRONMENT/$NAMESPACE"
+
+          for _ in 1 2 3 4 5; do
+            if git push origin HEAD:main; then exit 0; fi
+            git pull --rebase origin main
+          done
+          echo "::error::Failed to push changes after 5 attempts"
+          exit 1
+
