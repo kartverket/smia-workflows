@@ -20,7 +20,7 @@ on:
         required: true
         type: string
       namespace:
-        description: "Kubernetes namespace to deploy to"
+        description: "Kubernetes namespace or JSON list of namespaces to deploy to"
         required: true
         type: string
       identity:
@@ -103,45 +103,60 @@ jobs:
               ;;
           esac
 
-          case "$NAMESPACE" in
-            *[!a-z0-9-]*|"")
-              echo "::error::namespace must match [a-z0-9-]+ (got \"$NAMESPACE\")"
-              exit 1
-              ;;
-          esac
+          if jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' <<< "$NAMESPACE" > /dev/null 2>&1; then
+            mapfile -t NAMESPACES < <(jq -r '.[]' <<< "$NAMESPACE")
+          else
+            NAMESPACES=("$NAMESPACE")
+          fi
 
           git config user.email "smia@kartverket.no"
           git config user.name "SMIA CI"
 
           IMAGEURL="ghcr.io/kartverket/$APP:$VERSION@$DIGEST"
 
-          {
-            echo "### Deploying \"$IMAGEURL\""
-            echo "Environment: $ENVIRONMENT"
-            echo "Namespace: $NAMESPACE"
-          } >> "$GITHUB_STEP_SUMMARY"
+          for NAMESPACE in "${NAMESPACES[@]}"; do
+            case "$NAMESPACE" in
+              *[!a-z0-9-]*|"")
+                echo "::error::namespace must match [a-z0-9-]+ (got \"$NAMESPACE\")"
+                exit 1
+                ;;
+            esac
 
-          FILE="env/$CLUSTER-$ENVIRONMENT/$NAMESPACE/$APP-version"
+            {
+              echo "### Deploying \"$IMAGEURL\""
+              echo "Environment: $ENVIRONMENT"
+              echo "Namespace: $NAMESPACE"
+            } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ ! -f "$FILE" ]; then
-            echo "::error::$FILE does not exist in smia-apps"
-            exit 1
-          fi
+            FILE="env/$CLUSTER-$ENVIRONMENT/$NAMESPACE/$APP-version"
 
-          echo "\"$IMAGEURL\"" > "$FILE"
-          git add "$FILE"
+            if [ ! -f "$FILE" ]; then
+              echo "::error::$FILE does not exist in smia-apps"
+              exit 1
+            fi
 
-          if git diff --cached --quiet; then
-            echo "No changes in the version file. Nothing to commit"
-            exit 0
-          fi
+            echo "\"$IMAGEURL\"" > "$FILE"
+            git add "$FILE"
 
-          git commit -m "Releaser $APP:$VERSION to $ENVIRONMENT/$NAMESPACE"
+            if git diff --cached --quiet; then
+              echo "No changes in the version file for $NAMESPACE. Nothing to commit"
+              continue
+            fi
 
-          for _ in 1 2 3 4 5; do
-            if git push origin HEAD:main; then exit 0; fi
-            git pull --rebase origin main
+            git commit -m "Releaser $APP:$VERSION to $ENVIRONMENT/$NAMESPACE"
+
+            PUSHED=false
+            for _ in 1 2 3 4 5; do
+              if git push origin HEAD:main; then
+                PUSHED=true
+                break
+              fi
+              git pull --rebase origin main
+            done
+
+            if [ "$PUSHED" != true ]; then
+              echo "::error::Failed to push changes after 5 attempts"
+              exit 1
+            fi
           done
-          echo "::error::Failed to push changes after 5 attempts"
-          exit 1
 
